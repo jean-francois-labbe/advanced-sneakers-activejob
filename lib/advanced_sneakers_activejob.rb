@@ -17,6 +17,7 @@ require 'advanced_sneakers_activejob/configuration'
 require 'advanced_sneakers_activejob/errors'
 require 'advanced_sneakers_activejob/publisher'
 require 'advanced_sneakers_activejob/delayed_publisher'
+require 'advanced_sneakers_activejob/leveled_delayed_publisher'
 require 'advanced_sneakers_activejob/active_job_patch'
 require 'advanced_sneakers_activejob/railtie' if defined?(::Rails::Railtie)
 require 'active_job/queue_adapters/advanced_sneakers_adapter'
@@ -66,12 +67,24 @@ module AdvancedSneakersActiveJob
       @delayed_publisher ||= AdvancedSneakersActiveJob::DelayedPublisher.new(**config.publisher_config)
     end
 
+    # Used when config.delayed_delivery resolves to :leveled.
+    # Host app should call #declare_topology! on it at boot.
+    def leveled_delayed_publisher
+      @leveled_delayed_publisher ||= AdvancedSneakersActiveJob::LeveledDelayedPublisher.new(
+        exchange: config.sneakers[:exchange],
+        **config.publisher_config
+      )
+    end
+
     def shutdown
       close_publisher(@publisher)
       @publisher = nil
 
       close_publisher(@delayed_publisher)
       @delayed_publisher = nil
+
+      close_publisher(@leveled_delayed_publisher)
+      @leveled_delayed_publisher = nil
     end
 
     # Based on ActiveSupport::Inflector#parameterize

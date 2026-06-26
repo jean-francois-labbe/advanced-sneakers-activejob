@@ -29,13 +29,59 @@ module ActiveJob
             message, options = publish_params(job)
             options[:headers] = { 'delay' => delay.to_i } # do not use x- prefix because headers exchanges ignore such headers
 
-            AdvancedSneakersActiveJob.delayed_publisher.publish(message, options)
+            select_delayed_publisher(delay: delay, job: job).publish(message, options)
           else
             enqueue(job)
           end
         end
 
+        # Honors config.delayed_delivery (symbol or callable returning :legacy / :leveled).
+        # Unknown or non-symbolizable values fall back to :legacy with a warning.
+        def select_delayed_publisher(delay: nil, job: nil)
+          strategy_value = AdvancedSneakersActiveJob.config.delayed_delivery
+          strategy = strategy_value.respond_to?(:call) ? strategy_value.call : strategy_value
+
+          strategy = downgrade_strategy_on_leveled_overflow(strategy, delay: delay, job: job)
+
+          case strategy
+          when :leveled, 'leveled'
+            AdvancedSneakersActiveJob.leveled_delayed_publisher
+          when :legacy, 'legacy'
+            AdvancedSneakersActiveJob.delayed_publisher
+          else
+            ::ActiveJob::Base.logger.warn { "AdvancedSneakersAdapter: unknown delayed_delivery #{strategy.inspect}, using :legacy" }
+            AdvancedSneakersActiveJob.delayed_publisher
+          end
+        end
+
         private
+
+        # Returns the original strategy unchanged unless `:leveled` was chosen
+        # AND the delay exceeds the leveled publisher's max_delay; in that
+        # case downgrades to `:legacy` for this one publish, logs at warn
+        # level, and emits an AS::Notifications event for observability.
+        def downgrade_strategy_on_leveled_overflow(strategy, delay:, job:)
+          return strategy unless [:leveled, 'leveled'].include?(strategy)
+          return strategy if delay.nil?
+
+          max_delay = AdvancedSneakersActiveJob.leveled_delayed_publisher.max_delay
+          return strategy if delay <= max_delay
+
+          ::ActiveJob::Base.logger.warn do
+            "AdvancedSneakersAdapter: delay=#{delay}s exceeds LeveledDelayedPublisher max_delay=#{max_delay}s; " \
+              "falling back to :legacy DelayedPublisher for this publish" \
+              "#{job ? " (job=#{job.class.name})" : ''}."
+          end
+          ActiveSupport::Notifications.instrument(
+            'advanced_sneakers_activejob.leveled_overflow_to_legacy',
+            delay: delay,
+            max_delay: max_delay,
+            job_class: job&.class&.name,
+            queue: (job.respond_to?(:queue_name) ? job.queue_name : nil)
+          )
+
+          :legacy
+        end
 
         def publish_params(job)
           @monitor.synchronize do
