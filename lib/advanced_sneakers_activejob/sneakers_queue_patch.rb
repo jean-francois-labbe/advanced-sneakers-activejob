@@ -21,15 +21,17 @@ module AdvancedSneakersActiveJob
       # Tracks bound queue names to warn about topic cross-matches:
       # "#.b" also matches deliveries destined for queue "a.b".
       def cross_matching_names(name)
-        @mutex ||= Mutex.new
         @mutex.synchronize do
-          @known_names ||= Set.new
           matches = @known_names.select { |other| other.end_with?(".#{name}") || name.end_with?(".#{other}") }.to_a
           @known_names << name
           matches
         end
       end
     end
+
+    # Eager init: subscribers run concurrently, lazy ||= would race.
+    @mutex = Mutex.new
+    @known_names = Set.new
 
     def subscribe(worker)
       super.tap { bind_to_delayed_delivery_exchange }
@@ -42,17 +44,32 @@ module AdvancedSneakersActiveJob
 
       delivery_exchange = LeveledDelayedPublisher::DELIVERY_EXCHANGE
 
-      # Idempotent declare first: binding to a missing exchange 404s and
-      # closes the consumer channel on hosts that never declared the topology.
-      channel.topic(delivery_exchange, durable: true)
-      channel.queue_bind(name, delivery_exchange, routing_key: "#.#{name}")
-
+      declare_and_bind(delivery_exchange)
       warn_on_cross_matching_names(delivery_exchange)
     rescue StandardError => e
       # Fail open: a consumer without the delay binding beats a crash-looping
       # fleet. Delayed jobs maturing for this queue are dropped until the
       # binding exists.
       log_bind_failure(delivery_exchange, e)
+    end
+
+    # Dedicated short-lived channel: broker-side declare/bind failures
+    # (403 access_refused, 406 precondition_failed) close the channel that
+    # issued them, which must never be the consumer's.
+    def declare_and_bind(delivery_exchange)
+      bind_channel = channel.connection.create_channel
+      # Idempotent declare first: binding to a missing exchange 404s on
+      # hosts that never declared the topology.
+      bind_channel.topic(delivery_exchange, durable: true)
+
+      # Matured messages carry routing key "<bits>.<original key>", so mirror
+      # every immediate-path binding key (kicks binds routing_key || name),
+      # plus the queue name — the default for fresh delayed publishes.
+      [*(opts[:routing_key] || name), name].uniq.each do |key|
+        bind_channel.queue_bind(name, delivery_exchange, routing_key: "#.#{key}")
+      end
+    ensure
+      bind_channel.close if bind_channel&.open?
     end
 
     def log_bind_failure(delivery_exchange, error)

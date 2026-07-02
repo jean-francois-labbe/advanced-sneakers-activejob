@@ -30,6 +30,16 @@ describe 'Sneakers::Queue patch' do
       end
     end
 
+    context 'with a custom routing key' do
+      let(:opts) { AdvancedSneakersActiveJob.config.sneakers.merge(connection: connection, routing_key: 'custom_key') }
+
+      it 'binds delay.delivery.x for the routing key and the queue name' do
+        queue.subscribe(worker)
+
+        expect(routing_keys(queue: 'custom', exchange: 'delay.delivery.x')).to contain_exactly('#.custom', '#.custom_key')
+      end
+    end
+
     context 'with a non-ActiveJob exchange' do
       let(:opts) { AdvancedSneakersActiveJob.config.sneakers.merge(connection: connection, exchange: 'sneakers') }
 
@@ -55,7 +65,9 @@ describe 'Sneakers::Queue patch' do
       end
 
       before do
-        allow_any_instance_of(Bunny::Channel).to receive(:topic).and_raise('the broker said no')
+        # Real broker refusal: mismatched exchange type makes the declare fail
+        # with 406 PRECONDITION_FAILED, which closes the declaring channel.
+        connection.create_channel.fanout('delay.delivery.x', durable: true)
       end
 
       it 'logs an error and consumes anyway' do
@@ -63,7 +75,8 @@ describe 'Sneakers::Queue patch' do
         allow(worker).to receive(:do_work) { |_, _, msg, _| messages.push(msg) }
 
         expect { queue.subscribe(worker) }.not_to raise_error
-        expect(log.string).to include('Failed to bind queue [custom] to exchange [delay.delivery.x]: RuntimeError: the broker said no')
+        expect(log.string).to include('Failed to bind queue [custom] to exchange [delay.delivery.x]')
+        expect(log.string).to include('PRECONDITION_FAILED')
 
         connection.create_channel.direct('activejob', durable: true).publish('payload', routing_key: 'custom')
 
