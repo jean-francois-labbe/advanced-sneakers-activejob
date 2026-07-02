@@ -18,6 +18,7 @@ require 'advanced_sneakers_activejob/errors'
 require 'advanced_sneakers_activejob/publisher'
 require 'advanced_sneakers_activejob/delayed_publisher'
 require 'advanced_sneakers_activejob/leveled_delayed_publisher'
+require 'advanced_sneakers_activejob/sneakers_queue_patch'
 require 'advanced_sneakers_activejob/active_job_patch'
 require 'advanced_sneakers_activejob/railtie' if defined?(::Rails::Railtie)
 require 'active_job/queue_adapters/advanced_sneakers_adapter'
