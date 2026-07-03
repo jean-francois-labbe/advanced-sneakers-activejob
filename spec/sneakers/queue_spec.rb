@@ -80,7 +80,7 @@ describe 'Sneakers::Queue patch' do
 
         connection.create_channel.direct('activejob', durable: true).publish('payload', routing_key: 'custom')
 
-        expect(messages.pop(timeout: 5)).to eq('payload')
+        expect(Timeout.timeout(5) { messages.pop }).to eq('payload')
       end
     end
   end
