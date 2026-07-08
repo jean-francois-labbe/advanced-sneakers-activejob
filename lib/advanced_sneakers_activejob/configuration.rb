@@ -1,39 +1,50 @@
 # frozen_string_literal: true
 
+require 'active_support/ordered_options'
+
 module AdvancedSneakersActiveJob
   # Advanced Sneakers adapter allows to patch Sneakers with custom configuration.
   # It is useful when already have Sneakers workers running and you want to run ActiveJob Sneakers process with another options.
   class Configuration
-    include ActiveSupport::Configurable
-
     DEFAULT_SNEAKERS_CONFIG = {
       exchange: 'activejob',
       handler: AdvancedSneakersActiveJob::Handler
     }.freeze
 
-    config_accessor(:handle_unrouted_messages) { true } # create queue/binding and re-publish if message is unrouted
-    config_accessor(:activejob_workers_strategy) { :include } # [:include, :exclude, :only]
-    config_accessor(:delay_proc) { ->(timestamp) { (timestamp - Time.now.to_f).round } } # seconds
-    config_accessor(:delayed_queue_prefix) { 'delayed' }
-    config_accessor(:delayed_queue_options) { { 'x-queue-mode' => 'lazy' } }
-    config_accessor(:retry_delay_proc) { ->(count) { AdvancedSneakersActiveJob::EXPONENTIAL_BACKOFF[count] } } # seconds
-    config_accessor(:log_level) { :info } # debug logs are too noizy because of Bunny
+    DEFAULTS = {
+      handle_unrouted_messages: true, # create queue/binding and re-publish if message is unrouted
+      activejob_workers_strategy: :include, # [:include, :exclude, :only]
+      delay_proc: ->(timestamp) { (timestamp - Time.now.to_f).round }, # seconds
+      delayed_queue_prefix: 'delayed',
+      delayed_queue_options: { 'x-queue-mode' => 'lazy' },
+      retry_delay_proc: ->(count) { AdvancedSneakersActiveJob::EXPONENTIAL_BACKOFF[count] }, # seconds
+      log_level: :info, # debug logs are too noizy because of Bunny
+      # :legacy or :leveled. Accepts a symbol or a callable returning one.
+      # Adapter dispatches per-publish via this value.
+      delayed_delivery: :legacy,
+      # Number of TTL levels in the leveled delayed delivery topology.
+      delayed_delivery_levels: 20,
+      # When true (default), LeveledDelayedPublisher ensures the destination
+      # queue's `#.<destination>` binding on delay.delivery.x exists (just-in-time,
+      # memoized per process) before publishing a delayed message. Closes the
+      # window where a delayed job is published before the destination worker has
+      # ever booted with the new gem. Set to false to skip the JIT bind entirely.
+      leveled_ensure_binding_on_publish: true,
+      publish_connection: nil
+    }.freeze
 
-    # :legacy or :leveled. Accepts a symbol or a callable returning one.
-    # Adapter dispatches per-publish via this value.
-    config_accessor(:delayed_delivery) { :legacy }
+    # Stores arbitrary configuration options, similar to ActiveSupport::OrderedOptions.
+    attr_reader :config
 
-    # Number of TTL levels in the leveled delayed delivery topology.
-    config_accessor(:delayed_delivery_levels) { 20 }
+    def initialize
+      @config = ActiveSupport::OrderedOptions.new
+      DEFAULTS.each { |key, value| config[key] = value }
+    end
 
-    # When true (default), LeveledDelayedPublisher ensures the destination
-    # queue's `#.<destination>` binding on delay.delivery.x exists (just-in-time,
-    # memoized per process) before publishing a delayed message. Closes the
-    # window where a delayed job is published before the destination worker has
-    # ever booted with the new gem. Set to false to skip the JIT bind entirely.
-    config_accessor(:leveled_ensure_binding_on_publish) { true }
-
-    config_accessor(:publish_connection)
+    DEFAULTS.each_key do |name|
+      define_method(name) { config[name] }
+      define_method(:"#{name}=") { |value| config[name] = value }
+    end
 
     def republish_connection=(_)
       ActiveSupport::Deprecation.warn('Republish connection is not used for bunny-publisher v0.2+')
