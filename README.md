@@ -70,6 +70,36 @@ Take into accout that **this process is asynchronous**. It means that in case of
 
 **Delayed messages are not handled!** If job is delayed `GuestsCleanupJob.set(wait: 1.week).perform_later(guest)` and there is no proper routing defined at the moment of job execution, it would be lost.
 
+## Leveled delayed delivery: parking unroutable messages
+
+**Requirements:** the leveled path declares the `delay.level.*` queues as quorum queues with per-level message TTL (`x-message-ttl`), which RabbitMQ supports on quorum queues only from **3.10** onwards. On older brokers `LeveledDelayedPublisher#declare_topology!` fails fast with `AdvancedSneakersActiveJob::BrokerVersionError` rather than a cryptic `PRECONDITION_FAILED`; run `config.delayed_delivery = :legacy` on brokers below 3.10.
+
+The leveled delayed topology terminates on the `delay.delivery.x` topic exchange. A message reaching it with no matching binding would be silently dropped — the final hop is a broker-internal dead-letter republish, so the `mandatory` flag cannot catch it. As a safety net, `LeveledDelayedPublisher#declare_topology!` also declares:
+
+- durable fanout exchange `delay.delivery.unrouted.x`
+- durable quorum queue `delay.delivery.parking`, bound to that exchange
+
+To route unroutable messages into it, attach the alternate exchange to `delay.delivery.x` **via policy** as part of leveled-topology setup:
+
+```sh
+rabbitmqctl set_policy delay-delivery-ae '^delay\.delivery\.x$' \
+  '{"alternate-exchange":"delay.delivery.unrouted.x"}' --apply-to exchanges
+```
+
+The policy (rather than a declare-time `alternate-exchange` argument) is deliberate: the exchange already exists without that argument, and redeclaring an exchange with new arguments fails with 406 `PRECONDITION_FAILED`. Caveats:
+
+- RabbitMQ applies at most **one** policy per resource. If another policy already matches `delay.delivery.x`, merge `"alternate-exchange"` into its definition instead of adding a second policy.
+- A declare-time `alternate-exchange` argument would take precedence over the policy — the gem intentionally declares none.
+
+An alternate exchange is a routing fallback, not a retry loop — it cannot duplicate messages (unlike quorum `dead-letter-strategy=at-least-once`, which can redeliver duplicates to the target).
+
+### Redriving parked messages
+
+Parked messages retain their full bit-prefixed routing key (`b19...b0.<queue>`). To redrive:
+
+1. Fix the missing binding (start the consumer, or bind the target queue to `delay.delivery.x` with pattern `#.<queue>`).
+2. Shovel `delay.delivery.parking` → `delay.delivery.x`. The preserved routing key re-matches on its own. Do **not** shovel to the `activejob` direct exchange — the bit-prefixed key matches nothing there.
+
 ## Custom message options
 
 Advanced sneakers adapter allows to set [custom message options](http://reference.rubybunny.info/Bunny/Exchange.html#publish-instance_method) (e.g. [routing keys](https://www.rabbitmq.com/tutorials/tutorial-four-ruby.html)) on class-level.

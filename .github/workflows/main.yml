@@ -11,7 +11,10 @@ jobs:
 
     services:
       rabbitmq:
-        image: rabbitmq:3.8-management-alpine
+        # Quorum queues gained x-message-ttl support in RabbitMQ 3.10; the
+        # leveled delayed topology (delay.level.* quorum queues with TTL)
+        # cannot be declared on older brokers. Match production (>= 3.10).
+        image: rabbitmq:3.13-management-alpine
         options: >-
           --health-cmd "rabbitmq-diagnostics -q listeners"
           --health-interval 10s

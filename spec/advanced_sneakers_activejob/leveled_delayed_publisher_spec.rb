@@ -37,6 +37,11 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
     it 'names the delivery exchange explicitly' do
       expect(described_class::DELIVERY_EXCHANGE).to eq('delay.delivery.x')
     end
+
+    it 'names the unrouted parking topology explicitly' do
+      expect(described_class::UNROUTED_EXCHANGE).to eq('delay.delivery.unrouted.x')
+      expect(described_class::PARKING_QUEUE).to eq('delay.delivery.parking')
+    end
   end
 
   describe '#level_queue_name' do
@@ -193,9 +198,13 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
     let(:exchanges) { Hash.new { |h, k| h[k] = instance_double('Bunny::Exchange', bind: nil) } }
     let(:queues) { Hash.new { |h, k| h[k] = instance_double('Bunny::Queue', bind: nil) } }
 
+    let(:connection) { instance_double('Bunny::Session', server_properties: { 'version' => '3.13.7' }) }
+
     before do
       allow(publisher).to receive(:channel).and_return(channel)
+      allow(channel).to receive(:connection).and_return(connection)
       allow(channel).to receive(:topic) { |name, **| exchanges[name] }
+      allow(channel).to receive(:fanout) { |name, **| exchanges[name] }
       allow(channel).to receive(:queue) { |name, **| queues[name] }
     end
 
@@ -290,9 +299,94 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
       )
     end
 
+    it 'declares the unrouted fanout exchange and the parking quorum queue bound to it' do
+      publisher.declare_topology!
+
+      expect(channel).to have_received(:fanout).with('delay.delivery.unrouted.x', durable: true)
+      expect(channel).to have_received(:queue).with(
+        'delay.delivery.parking',
+        durable: true,
+        arguments: { 'x-queue-type' => 'quorum' }
+      )
+      expect(queues['delay.delivery.parking']).to have_received(:bind).with(exchanges['delay.delivery.unrouted.x'])
+    end
+
+    it 'keeps pre-existing declarations byte-identical (406 PRECONDITION_FAILED guard)' do
+      publisher.declare_topology!
+
+      # The alternate-exchange is attached via policy, never as a declare-time
+      # argument — delay.delivery.x already exists in production without any
+      # arguments, and redeclaring with new ones would 406 on every boot.
+      expect(channel).not_to have_received(:topic).with(anything, hash_including(:arguments))
+      expect(channel).not_to have_received(:fanout).with(anything, hash_including(:arguments))
+
+      (0...20).each do |n|
+        expect(channel).to have_received(:queue).with(
+          format('delay.level.%02d', n),
+          durable: true,
+          arguments: {
+            'x-queue-type' => 'quorum',
+            'x-message-ttl' => (1 << n) * 1000,
+            'x-dead-letter-exchange' => n.zero? ? 'delay.delivery.x' : format('delay.level.%02d.x', n - 1)
+          }
+        ).once
+      end
+    end
+
     it 'is idempotent (safe to call twice)' do
       publisher.declare_topology!
       expect { publisher.declare_topology! }.not_to raise_error
+    end
+
+    context 'when the broker predates quorum-queue TTL support (< 3.10)' do
+      let(:connection) { instance_double('Bunny::Session', server_properties: { 'version' => '3.8.35' }) }
+
+      it 'fails fast with a clear BrokerVersionError before declaring anything' do
+        expect { publisher.declare_topology! }
+          .to raise_error(AdvancedSneakersActiveJob::BrokerVersionError, /requires RabbitMQ >= 3\.10.*3\.8\.35/)
+
+        expect(channel).not_to have_received(:topic)
+        expect(channel).not_to have_received(:queue)
+      end
+    end
+
+    context 'when the broker is 4.x' do
+      let(:connection) { instance_double('Bunny::Session', server_properties: { 'version' => '4.0.1' }) }
+
+      it 'declares the topology' do
+        expect { publisher.declare_topology! }.not_to raise_error
+        expect(channel).to have_received(:topic).with('delay.delivery.x', durable: true).at_least(:once)
+      end
+    end
+
+    context 'when the broker version cannot be determined' do
+      let(:connection) { instance_double('Bunny::Session', server_properties: {}) }
+
+      it 'proceeds rather than blocking a possibly-valid broker' do
+        expect { publisher.declare_topology! }.not_to raise_error
+      end
+    end
+
+    context 'against a real broker', :rabbitmq do
+      let(:connection) { Bunny.new(ENV.fetch('RABBITMQ_URL')).start }
+
+      after { connection.close }
+
+      it 'declares the parking topology and is idempotent on repeat calls' do
+        2.times { publisher.declare_topology!(connection.create_channel) }
+
+        http_api = RabbitmqHelpers.http_api
+        exchange = http_api.client.exchange_info(http_api.vhost, 'delay.delivery.unrouted.x')
+        expect(exchange.type).to eq('fanout')
+        expect(exchange.durable).to be(true)
+
+        parking = rabbitmq_queues.find { |queue| queue.name == 'delay.delivery.parking' }
+        expect(parking.durable).to be(true)
+        expect(parking.arguments.to_h).to eq('x-queue-type' => 'quorum')
+
+        bindings = rabbitmq_bindings(queue: 'delay.delivery.parking', exchange: 'delay.delivery.unrouted.x')
+        expect(bindings.size).to eq(1)
+      end
     end
   end
 end
