@@ -26,6 +26,13 @@ module AdvancedSneakersActiveJob
     # Number of TTL levels in the leveled delayed delivery topology.
     config_accessor(:delayed_delivery_levels) { 20 }
 
+    # When true (default), LeveledDelayedPublisher ensures the destination
+    # queue's `#.<destination>` binding on delay.delivery.x exists (just-in-time,
+    # memoized per process) before publishing a delayed message. Closes the
+    # window where a delayed job is published before the destination worker has
+    # ever booted with the new gem. Set to false to skip the JIT bind entirely.
+    config_accessor(:leveled_ensure_binding_on_publish) { true }
+
     config_accessor(:publish_connection)
 
     def republish_connection=(_)

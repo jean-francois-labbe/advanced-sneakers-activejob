@@ -17,6 +17,9 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
     publisher.instance_variable_set(:@mutex, Mutex.new)
     publisher.instance_variable_set(:@levels, levels)
     publisher.instance_variable_set(:@max_delay, max_delay)
+    # Normally set by our initialize; set directly here since we bypass it.
+    publisher.instance_variable_set(:@bound_destinations, Set.new)
+    publisher.instance_variable_set(:@bound_destinations_mutex, Mutex.new)
     allow(publisher).to receive(:logger).and_return(Logger.new(IO::NULL))
     publisher
   end
@@ -105,6 +108,10 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
       allow(publisher).to receive(:ensure_connection!).and_return(nil)
       allow(publisher).to receive(:channel).and_return(channel)
       allow(channel).to receive(:topic).and_return(exchange)
+      # The JIT destination bind opens its own dedicated channel against a live
+      # broker; these tests focus on routing-key/exchange selection, so stub it.
+      # Its own behavior is covered by the '#ensure_destination_binding!' specs.
+      allow(publisher).to receive(:ensure_destination_binding!)
     end
 
     context 'channel lifecycle' do
@@ -189,6 +196,201 @@ describe AdvancedSneakersActiveJob::LeveledDelayedPublisher do
         publisher.publish('payload', routing_key: 'q', headers: { 'delay' => -5 })
 
         expect(channel).to have_received(:direct).with('activejob', durable: true)
+      end
+    end
+  end
+
+  describe 'just-in-time destination binding on delayed publish' do
+    # Fast tests: a fake connection whose #create_channel hands back a spy
+    # channel, so we can assert bind calls / channel isolation without a broker.
+    let(:publish_channel) { instance_double('Bunny::Channel', topic: publish_exchange, direct: publish_exchange) }
+    let(:publish_exchange) { instance_double('Bunny::Exchange', publish: nil) }
+    let(:bind_channel) { instance_double('Bunny::Channel', queue_bind: nil, close: nil, open?: true) }
+    let(:connection) { instance_double('Bunny::Session', create_channel: bind_channel) }
+
+    before do
+      # Parent publish flow: keep it off a live broker.
+      allow(publisher).to receive(:ensure_connection!).and_return(nil)
+      allow(publisher).to receive(:channel).and_return(publish_channel)
+      allow(publisher).to receive(:connection).and_return(connection)
+    end
+
+    it 'binds the destination to delay.delivery.x with a "#.<destination>" routing key on the first delayed publish' do
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+      expect(bind_channel).to have_received(:queue_bind).with('orders', 'delay.delivery.x', routing_key: '#.orders')
+    end
+
+    it 'performs the bind on a dedicated channel, not the shared publish channel' do
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+      expect(connection).to have_received(:create_channel)
+      expect(bind_channel).to have_received(:close)
+    end
+
+    it 'does not issue a second bind for the same destination (memoized per process)' do
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 3 })
+
+      expect(connection).to have_received(:create_channel).once
+      expect(bind_channel).to have_received(:queue_bind).once
+    end
+
+    it 'binds each distinct destination once' do
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 5 })
+      publisher.publish('payload', routing_key: 'invoices', headers: { 'delay' => 5 })
+
+      expect(bind_channel).to have_received(:queue_bind).with('orders', 'delay.delivery.x', routing_key: '#.orders')
+      expect(bind_channel).to have_received(:queue_bind).with('invoices', 'delay.delivery.x', routing_key: '#.invoices')
+    end
+
+    it 'never binds for immediate publishes (delay <= 0)' do
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 0 })
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => -3 })
+
+      expect(connection).not_to have_received(:create_channel)
+      expect(bind_channel).not_to have_received(:queue_bind)
+    end
+
+    it 'skips the bind entirely when config.leveled_ensure_binding_on_publish is false' do
+      AdvancedSneakersActiveJob.config.leveled_ensure_binding_on_publish = false
+
+      publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+      expect(connection).not_to have_received(:create_channel)
+    ensure
+      AdvancedSneakersActiveJob.config.leveled_ensure_binding_on_publish = true
+    end
+
+    context 'when the destination queue does not exist (404)' do
+      before do
+        allow(bind_channel).to receive(:queue_bind).and_raise(Bunny::NotFound.new('NOT_FOUND', bind_channel, false))
+        # A channel-level exception closes the channel; model that.
+        allow(bind_channel).to receive(:open?).and_return(false)
+      end
+
+      it 'logs a warning and still publishes the message' do
+        expect(publisher.logger).to receive(:warn)
+
+        publisher.publish('payload', routing_key: 'ghost', headers: { 'delay' => 47 })
+
+        expect(publish_exchange).to have_received(:publish)
+      end
+
+      it 'does not memoize a failed bind (retries on the next publish)' do
+        publisher.publish('payload', routing_key: 'ghost', headers: { 'delay' => 47 })
+        publisher.publish('payload', routing_key: 'ghost', headers: { 'delay' => 47 })
+
+        expect(bind_channel).to have_received(:queue_bind).twice
+      end
+
+      it 'remains usable for other (healthy) destinations after a 404 (channel isolation)' do
+        # First destination 404s on its own dedicated channel...
+        publisher.publish('payload', routing_key: 'ghost', headers: { 'delay' => 47 })
+
+        # ...a healthy destination binds successfully on a fresh dedicated channel.
+        healthy_channel = instance_double('Bunny::Channel', queue_bind: nil, close: nil, open?: true)
+        allow(connection).to receive(:create_channel).and_return(healthy_channel)
+
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+        expect(healthy_channel).to have_received(:queue_bind).with('orders', 'delay.delivery.x', routing_key: '#.orders')
+      end
+    end
+
+    context 'when the broker connection blips during the bind (non-404 error)' do
+      before do
+        allow(connection).to receive(:create_channel).and_raise(Bunny::NetworkFailure.new('connection down', nil))
+      end
+
+      it 'logs a warning and still publishes the message (enqueue must never fail on a bind)' do
+        expect(publisher.logger).to receive(:warn)
+
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+        expect(publish_exchange).to have_received(:publish)
+      end
+
+      it 'does not memoize, so the bind retries once the connection recovers' do
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+        allow(connection).to receive(:create_channel).and_return(bind_channel)
+
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+
+        expect(bind_channel).to have_received(:queue_bind).with('orders', 'delay.delivery.x', routing_key: '#.orders')
+      end
+    end
+
+    describe 'memo invalidation on #reset_exchange!' do
+      before { allow(publisher).to receive(:build_exchange).and_return(publish_exchange) }
+
+      it 're-binds a previously-bound destination after reset_exchange!' do
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+        expect(bind_channel).to have_received(:queue_bind).once
+
+        publisher.reset_exchange!
+
+        publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 47 })
+        expect(bind_channel).to have_received(:queue_bind).twice
+      end
+    end
+
+    context 'against a real broker', :rabbitmq do
+      let(:levels) { 4 } # keep the real topology small/fast
+      let(:real_logger) { Logger.new(IO::NULL) }
+      let(:real_connection) { Bunny.new(ENV.fetch('RABBITMQ_URL')).start }
+      let(:real_publisher) do
+        described_class.new(
+          exchange: 'activejob',
+          levels: levels,
+          connection: real_connection,
+          exchange_options: { type: 'topic', durable: true }
+        )
+      end
+
+      before do
+        # #logger delegates to ::ActiveJob::Base, which is not loaded in an
+        # isolated spec run; give the real publisher a concrete logger.
+        allow(real_publisher).to receive(:logger).and_return(real_logger)
+        setup_channel = real_connection.create_channel
+        real_publisher.declare_topology!(setup_channel)
+        # Bind-only requires the destination QUEUE to exist; declare it (with
+        # host-neutral args) so queue_bind succeeds.
+        setup_channel.queue('orders', durable: true)
+        setup_channel.close
+      end
+
+      after { real_connection.close }
+
+      it 'creates the "#.orders" binding on delay.delivery.x on first publish and reuses it on the second' do
+        real_publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 3 })
+
+        bindings = rabbitmq_bindings(queue: 'orders', exchange: 'delay.delivery.x')
+        matching = bindings.select { |b| b.routing_key == '#.orders' }
+        expect(matching.size).to eq(1)
+
+        # Second publish must not create a duplicate binding (memoized).
+        real_publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 5 })
+
+        bindings = rabbitmq_bindings(queue: 'orders', exchange: 'delay.delivery.x')
+        expect(bindings.select { |b| b.routing_key == '#.orders' }.size).to eq(1)
+      end
+
+      it 'logs a warning and still publishes when the destination queue is absent, staying usable afterwards' do
+        expect(real_logger).to receive(:warn).at_least(:once).and_call_original
+
+        expect do
+          real_publisher.publish('payload', routing_key: 'never_declared', headers: { 'delay' => 3 })
+        end.not_to raise_error
+
+        # Publisher is still usable for a healthy destination (channel isolation).
+        expect do
+          real_publisher.publish('payload', routing_key: 'orders', headers: { 'delay' => 3 })
+        end.not_to raise_error
+
+        matching = rabbitmq_bindings(queue: 'orders', exchange: 'delay.delivery.x').select { |b| b.routing_key == '#.orders' }
+        expect(matching.size).to eq(1)
       end
     end
   end

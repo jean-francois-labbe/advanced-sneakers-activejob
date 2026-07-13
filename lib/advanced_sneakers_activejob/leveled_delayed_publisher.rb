@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'set'
+
 module AdvancedSneakersActiveJob
   # Bounded power-of-two TTL delayed publisher.
   #
@@ -78,6 +80,13 @@ module AdvancedSneakersActiveJob
       @levels = levels
       @max_delay = (1 << levels) - 1
 
+      # Per-process memo of destinations already bound to DELIVERY_EXCHANGE, so
+      # steady-state delayed publishes cost zero broker round-trips. Guarded by
+      # its own mutex (independent of the parent's publish mutex) because the
+      # JIT bind happens on a dedicated channel outside the parent's lock.
+      @bound_destinations = Set.new
+      @bound_destinations_mutex = Mutex.new
+
       # Base needs an exchange; we route per-publish so the parent's
       # @exchange is effectively a placeholder. Our #exchange override
       # picks the real per-message target.
@@ -146,6 +155,13 @@ module AdvancedSneakersActiveJob
 
       if delay > 0
         destination = options[:routing_key].to_s
+
+        # JIT bind BEFORE handing off to super. The parent's #publish runs
+        # inside a non-reentrant mutex and its with_errors_handling does NOT
+        # retry Bunny::NotFound, so the bind must happen outside that locked
+        # flow — on its own dedicated channel (see #ensure_destination_binding!).
+        ensure_destination_binding!(destination)
+
         options = options.merge(routing_key: build_routing_key(delay, destination))
 
         logger.debug do
@@ -185,6 +201,11 @@ module AdvancedSneakersActiveJob
       super
       @level_exchanges = nil
       @immediate_exchange = nil
+
+      # A channel/connection rebuild means our per-process bind memo can no
+      # longer be trusted to reflect broker state we observed on the old
+      # channel; drop it so the next delayed publish re-verifies the binding.
+      @bound_destinations_mutex&.synchronize { @bound_destinations&.clear }
     end
 
     # (levels + 1)-segment routing key: b{levels-1}...b00.<destination>
@@ -259,6 +280,81 @@ module AdvancedSneakersActiveJob
         remaining >>= 1
       end
       bit
+    end
+
+    # Just-in-time bind of `delay.delivery.x -> <destination>` with routing key
+    # `#.<destination>`. NServiceBus does the equivalent on every delayed send
+    # (ConfirmsAwareChannel#SendMessage -> BindToDelayInfrastructure). This
+    # closes the window where a delayed job is published before the destination
+    # queue's worker has ever booted (and thus bound itself) with the new gem.
+    #
+    # Contract (all deliberate, see BEP-9890):
+    #   * Bind ONLY, never declare. queue_bind binds by name and needs no
+    #     knowledge of the queue's declaration arguments; declaring risks
+    #     406/PRECONDITION_FAILED against host-managed quorum/SLA/rate-limited
+    #     queue args.
+    #   * Dedicated channel, NOT the shared publish channel. A missing queue
+    #     makes the bind fail 404 (Bunny::NotFound, a channel-level exception
+    #     that closes its channel). Isolating it keeps that failure from
+    #     churning healthy publishes on the shared channel.
+    #   * Run BEFORE super, outside the parent's non-reentrant publish mutex:
+    #     Bunny::NotFound is not in bunny-publisher's RETRIABLE_ERRORS and
+    #     would otherwise escape the locked flow uncleanly.
+    #   * 404 -> warn and continue. The broker-side parking/retention nets make
+    #     the message recoverable once queue+binding appear; failing the enqueue
+    #     would be a regression vs legacy behavior.
+    #   * Memoized per destination per process, so steady state costs zero
+    #     round-trips. Accepted staleness: if ops deletes+recreates a queue, a
+    #     process that already warmed the memo will NOT re-bind until restart
+    #     (or a channel reset invalidates the memo). The parking/retention net
+    #     covers that gap.
+    def ensure_destination_binding!(destination)
+      return unless AdvancedSneakersActiveJob.config.leveled_ensure_binding_on_publish
+      return if destination.empty?
+      return if destination_bound?(destination)
+
+      ensure_connection!
+
+      bind_channel = connection.create_channel
+      begin
+        bind_channel.queue_bind(destination, DELIVERY_EXCHANGE, routing_key: "#.#{destination}")
+        mark_destination_bound(destination)
+      rescue Bunny::NotFound
+        logger.warn do
+          "LeveledDelayedPublisher: destination queue [#{destination}] does not exist yet; " \
+          "publishing delayed message anyway (parking/retention net will recover it once the " \
+          "queue and its #.#{destination} binding appear)"
+        end
+      ensure
+        bind_channel.close if bind_channel.open?
+      end
+    # A broker/network error here (connection blip, closed channel, timeout)
+    # must not fail the enqueue: the parent publisher's retry machinery only
+    # engages inside super, and legacy behavior never raised for binding
+    # problems. Publish anyway; the failed bind is not memoized, so the next
+    # publish retries it, and the parking/retention nets cover the gap.
+    rescue StandardError => error
+      logger.warn do
+        "LeveledDelayedPublisher: could not ensure destination binding for [#{destination}] " \
+        "(#{error.class}: #{error.message}); publishing anyway (parking/retention net will " \
+        'recover the message once the binding appears)'
+      end
+    end
+
+    def destination_bound?(destination)
+      bound_destinations_mutex.synchronize { bound_destinations.include?(destination) }
+    end
+
+    def mark_destination_bound(destination)
+      bound_destinations_mutex.synchronize { bound_destinations.add(destination) }
+    end
+
+    def bound_destinations
+      @bound_destinations ||= Set.new
+    end
+
+    def bound_destinations_mutex
+      @bound_destinations_mutex ||= Mutex.new
     end
   end
 end
