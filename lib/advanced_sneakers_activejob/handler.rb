@@ -8,7 +8,14 @@ module AdvancedSneakersActiveJob
       params[:headers] = patch_headers(params[:headers] || {}, delivery_info, error)
       params[:routing_key] = delivery_info.routing_key
 
-      AdvancedSneakersActiveJob.delayed_publisher.publish(message, params)
+      # Route through the adapter's selection logic so consumer-side retries
+      # honor config.delayed_delivery (:legacy / :leveled / callable). The delay
+      # is the retry delay set_delay_in_headers just computed into headers['delay']
+      # (Integer seconds); passing it lets the leveled overflow auto-downgrade
+      # (delays > max_delay -> legacy) work exactly as for enqueue_at.
+      delay = params[:headers]['delay']
+      publisher = ::ActiveJob::QueueAdapters::AdvancedSneakersAdapter.select_delayed_publisher(delay: delay, job: nil)
+      publisher.publish(message, params)
 
       acknowledge(delivery_info, properties, message)
     end
