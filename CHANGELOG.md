@@ -4,8 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased](https://github.com/veeqo/advanced-sneakers-activejob/compare/v0.6.0...HEAD)
+## [Unreleased](https://github.com/BranchIntl/advanced-sneakers-activejob/compare/v0.8.0...HEAD)
 
+
+## [0.8.0](https://github.com/BranchIntl/advanced-sneakers-activejob/compare/v0.7.0...v0.8.0) - 2026-07-20
+
+### Added
+- [#10](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/10) Auto-bind every ActiveJob worker queue to `delay.delivery.x` (routing key `#.<queue>`) at subscribe time. Unconditional and idempotent.
+- [#11](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/11) `declare_topology!` additionally declares the `delay.delivery.unrouted.x` fanout and the `delay.delivery.parking` quorum queue as a safety net for unroutable matured messages. README documents the alternate-exchange policy and the redrive runbook.
+- [#12](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/12) `LeveledDelayedPublisher#publish` creates the destination binding just in time before a delayed publish when it is missing, memoized per destination per process. New config switch `leveled_ensure_binding_on_publish` (default `true`).
+
+### Fixed
+- [#11](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/11) `declare_topology!` raises `AdvancedSneakersActiveJob::BrokerVersionError` on brokers older than RabbitMQ 3.10 instead of a cryptic `PRECONDITION_FAILED`.
+- [#13](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/13) `Handler#error` selects its publisher through the adapter, so `:leveled` and callable `delayed_delivery` configs apply to consumer-side retries. `:legacy` behavior is unchanged.
+- [#13](https://github.com/BranchIntl/advanced-sneakers-activejob/pull/13) Queues auto-created by the mandatory republish flow are bound to both the ActiveJob exchange and `delay.delivery.x`.
 
 ## [0.6.0](https://github.com/veeqo/advanced-sneakers-activejob/compare/v0.5.0...v0.6.0) - 2022-02-15
 

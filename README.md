@@ -68,9 +68,11 @@ There is a setting `handle_unrouted_messages` in [configuration](#configuration)
 
 Take into accout that **this process is asynchronous**. It means that in case of network failures or process exit unrouted messages could be lost. The adapter tries to postpone application exit up to 5 seconds in case if there are unrouted messages, but it does not provide any guarantees.
 
-**Delayed messages are not handled!** If job is delayed `GuestsCleanupJob.set(wait: 1.week).perform_later(guest)` and there is no proper routing defined at the moment of job execution, it would be lost.
+Since v0.8.0 the same reachability holds for **delayed** jobs: any queue the gem's workers consume (bound at subscribe), or that this mandatory republish flow auto-creates (bound at creation), is reachable for both immediate and leveled delayed jobs, and the publisher additionally ensures the destination binding just in time before every delayed publish. Anything that still arrives at the delivery exchange with no matching binding is parked in `delay.delivery.parking` instead of being dropped — see the next section.
 
 ## Leveled delayed delivery: parking unroutable messages
+
+Host setup for leveled delivery is exactly two steps: call `AdvancedSneakersActiveJob.leveled_delayed_publisher.declare_topology!(channel)` once at boot, and attach the alternate-exchange policy shown below. Worker-queue bindings need no manual wiring — consumers bind at subscribe, the publisher ensures the binding just in time before each delayed publish, and queues auto-created by the mandatory republish flow are bound at creation.
 
 **Requirements:** the leveled path declares the `delay.level.*` queues as quorum queues with per-level message TTL (`x-message-ttl`), which RabbitMQ supports on quorum queues only from **3.10** onwards. On older brokers `LeveledDelayedPublisher#declare_topology!` fails fast with `AdvancedSneakersActiveJob::BrokerVersionError` rather than a cryptic `PRECONDITION_FAILED`; run `config.delayed_delivery = :legacy` on brokers below 3.10.
 
