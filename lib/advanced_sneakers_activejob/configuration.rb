@@ -33,7 +33,6 @@ module AdvancedSneakersActiveJob
       publish_connection: nil
     }.freeze
 
-    # Stores arbitrary configuration options, similar to ActiveSupport::OrderedOptions.
     attr_reader :config
 
     def initialize
@@ -41,10 +40,8 @@ module AdvancedSneakersActiveJob
       DEFAULTS.each { |key, value| config[key] = value }
     end
 
-    DEFAULTS.each_key do |name|
-      define_method(name) { config[name] }
-      define_method(:"#{name}=") { |value| config[name] = value }
-    end
+    delegate(*DEFAULTS.keys, to: :config)
+    delegate(*DEFAULTS.keys.map { |key| :"#{key}=" }, to: :config)
 
     def republish_connection=(_)
       ActiveSupport::Deprecation.warn('Republish connection is not used for bunny-publisher v0.2+')
